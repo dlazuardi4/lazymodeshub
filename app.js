@@ -1,4 +1,3 @@
-
 // ═══════════════════════════════════════════════════
 // SUPABASE INIT
 // ═══════════════════════════════════════════════════
@@ -1241,18 +1240,30 @@ function renderSidebar() {
   updateStorageBar();
 }
 
-function setActiveBiz(id) {
+async function setActiveBiz(id) {
   DB.set('active_biz', id);
   closeBizDD();
   renderSidebar();
   renderPage(currentPage);
+  const sc = scopeKey();
+  if (sc) {
+    try { await DB.pullScope(sc); } catch (e) { console.warn('pullScope failed:', e.message); }
+    renderSidebar();
+    renderPage(currentPage);
+  }
 }
-function switchBiz(id) {
+async function switchBiz(id) {
   DB.set('active_biz', id);
   DB.set('active_oase_proj', 'brand');
   closeBizDD();
   renderSidebar();
   renderPage('dashboard');
+  const sc = scopeKey();
+  if (sc) {
+    try { await DB.pullScope(sc); } catch (e) { console.warn('pullScope failed:', e.message); }
+    renderSidebar();
+    renderPage('dashboard');
+  }
 }
 function toggleBizDD() {
   const dd = document.getElementById('biz-dropdown');
@@ -1260,11 +1271,17 @@ function toggleBizDD() {
   const arrow = document.getElementById('biz-arrow');
   if (arrow) arrow.textContent = open ? '▴' : '▾';
 }
-function setOaseProj(id) {
+async function setOaseProj(id) {
   DB.set('active_oase_proj', id);
   closeBizDD();
   renderSidebar();
   renderPage(currentPage);
+  const sc = scopeKey();
+  if (sc) {
+    try { await DB.pullScope(sc); } catch (e) { console.warn('pullScope failed:', e.message); }
+    renderSidebar();
+    renderPage(currentPage);
+  }
 }
 
 // Biz dropdown
