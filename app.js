@@ -739,12 +739,15 @@ const DB = {
   // Pull ALL data for a scope from Supabase → localStorage
   async pullScope(scope) {
     if (!scope || typeof supa === 'undefined') return;
-    const pulls = Object.entries(SUPABASE_TABLES).map(([prefix, cfg]) => ({
-      key: prefix + scope,
-      table: cfg.table,
-      scope
-    }));
-    // Add special case for calendar (scoped by biz)
+    // 'calendar' is a single account-wide key (not per-business), so it's excluded
+    // from the generic scoped loop below and pulled separately with a fixed scope.
+    const pulls = Object.entries(SUPABASE_TABLES)
+      .filter(([prefix]) => prefix !== 'calendar')
+      .map(([prefix, cfg]) => ({
+        key: prefix + scope,
+        table: cfg.table,
+        scope
+      }));
     await Promise.allSettled(pulls.map(async ({ key, table, scope }) => {
       try {
         const { data } = await supa.from(table).select('*').eq('scope', scope);
@@ -753,6 +756,11 @@ const DB = {
         }
       } catch (e) { }
     }));
+    // Calendar: account-wide, matches the empty scope DB._push writes for the bare 'calendar' key
+    try {
+      const { data: calData } = await supa.from('calendar_events').select('*').eq('scope', '');
+      if (calData) localStorage.setItem('lazymodes_calendar', JSON.stringify(calData));
+    } catch (e) { }
     // Pull finance data
     await DB._pullFinance(scope);
   },
@@ -1700,7 +1708,10 @@ async function saveTask(id) {
   }
   closeModal(); renderPage('tasks');
 }
-function openAddTask(status = 'todo') { openModal('New Task', taskForm({ status }), () => saveTask(null), 'Create Task') }
+function openAddTask(status = 'todo') {
+  openModal('New Task', taskForm({ status }), () => saveTask(null), 'Create Task');
+  setTimeout(() => populateAssigneeDropdown(''), 200);
+}
 function openEditTask(id) {
   const sc = scopeKey(); const tasks = DB.get('tasks_' + sc) || []; const t = tasks.find(x => x.id === id); if (!t) return;
   openModal('Edit Task', taskForm(t), () => saveTask(id), 'Save Task', `<button class="btn btn-danger" onclick="deleteTask('${id}')">Delete</button>`);
