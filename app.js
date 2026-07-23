@@ -1,3 +1,4 @@
+
 // ═══════════════════════════════════════════════════
 // SUPABASE INIT
 // ═══════════════════════════════════════════════════
@@ -683,14 +684,6 @@ function _isLocalOnly(k) {
   return LOCAL_ONLY_KEYS.some(p => k.startsWith(p));
 }
 
-// Guards against a 'sales_' cache value that isn't the expected {kpi, kpi_unit, entries}
-// shape (e.g. left over from a bad sync) — returns safe defaults instead of crashing.
-function getSalesObj(sc, defaults) {
-  const v = DB.get('sales_' + sc);
-  if (v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(v.entries)) return v;
-  return { ...defaults, entries: [] };
-}
-
 function _getTableConfig(k) {
   for (const [prefix, cfg] of Object.entries(SUPABASE_TABLES)) {
     if (k.startsWith(prefix)) return { ...cfg, prefix, scope: k.slice(prefix.length) };
@@ -747,16 +740,12 @@ const DB = {
   // Pull ALL data for a scope from Supabase → localStorage
   async pullScope(scope) {
     if (!scope || typeof supa === 'undefined') return;
-    // 'calendar' is account-wide (not per-business) and 'sales_' stores an object
-    // wrapper ({kpi, kpi_unit, entries}) rather than a bare array — both are
-    // excluded from the generic scoped loop and pulled separately below.
-    const pulls = Object.entries(SUPABASE_TABLES)
-      .filter(([prefix]) => prefix !== 'calendar' && prefix !== 'sales_')
-      .map(([prefix, cfg]) => ({
-        key: prefix + scope,
-        table: cfg.table,
-        scope
-      }));
+    const pulls = Object.entries(SUPABASE_TABLES).map(([prefix, cfg]) => ({
+      key: prefix + scope,
+      table: cfg.table,
+      scope
+    }));
+    // Add special case for calendar (scoped by biz)
     await Promise.allSettled(pulls.map(async ({ key, table, scope }) => {
       try {
         const { data } = await supa.from(table).select('*').eq('scope', scope);
@@ -765,23 +754,6 @@ const DB = {
         }
       } catch (e) { }
     }));
-    // Calendar: account-wide, matches the empty scope DB._push writes for the bare 'calendar' key
-    try {
-      const { data: calData } = await supa.from('calendar_events').select('*').eq('scope', '');
-      if (calData) localStorage.setItem('lazymodes_calendar', JSON.stringify(calData));
-    } catch (e) { }
-    // Sales: merge fetched entries into the existing {kpi, kpi_unit, entries} object
-    try {
-      const { data: salesRows } = await supa.from('sale_entries').select('*').eq('scope', scope);
-      if (salesRows) {
-        const key = 'lazymodes_sales_' + scope;
-        let sd;
-        try { sd = JSON.parse(localStorage.getItem(key)); } catch (e) { }
-        if (!sd || typeof sd !== 'object' || Array.isArray(sd)) sd = { kpi: 0, kpi_unit: '', entries: [] };
-        sd.entries = salesRows;
-        localStorage.setItem(key, JSON.stringify(sd));
-      }
-    } catch (e) { }
     // Pull finance data
     await DB._pullFinance(scope);
   },
@@ -859,7 +831,7 @@ function seed() {
   DB.set('active_biz', 'oase');
   DB.set('user', { name: 'Owner', initials: 'OW' });
   if (typeof supa !== 'undefined' && isOwner) {
-    Promise.resolve(supa.from('businesses').upsert(bizzes, { onConflict: 'id' })).catch(() => { });
+    supa.from('businesses').upsert(bizzes, { onConflict: 'id' }).catch(() => { });
   }
 
   // OASE projects
@@ -1377,7 +1349,7 @@ function pgDashboard(c, tb) {
   const notes = DB.get('notes_' + sc) || [];
   const allEvents = DB.get('calendar') || [];
   const upcoming = allEvents.filter(e => e.date >= now.toISOString().split('T')[0]).sort((a, b) => a.date > b.date ? 1 : -1).slice(0, 4);
-  const sales = getSalesObj(sc, { kpi: 0, kpi_unit: '' });
+  const sales = DB.get('sales_' + sc) || { kpi: 0, kpi_unit: '', entries: [] };
   const closedSales = sales.entries.filter(e => e.status === 'closed').length;
   const kpiPct = sales.kpi ? Math.min(100, Math.round(closedSales / sales.kpi * 100)) : 0;
 
@@ -1546,7 +1518,7 @@ function openAddEvent() {
       if (inviteeIds.length && currentUser) {
         for (const uid of inviteeIds) {
           if (uid === currentUser.id) continue;
-          Promise.resolve(supa.from('notifications').insert({ user_id: uid, type: 'calendar_invite', title: '📅 You were invited: ' + title, body: 'Date: ' + date + (ev.desc ? ' · ' + ev.desc : '') })).catch(() => { });
+          supa.from('notifications').insert({ user_id: uid, type: 'calendar_invite', title: '📅 You were invited: ' + title, body: 'Date: ' + date + (ev.desc ? ' · ' + ev.desc : '') }).catch(() => { });
         }
       }
       const gcalUrl = `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(title)}&dates=${date.replace(/-/g, '')}/${date.replace(/-/g, '')}&details=${encodeURIComponent(ev.desc || '')}`;
@@ -1718,21 +1690,18 @@ async function saveTask(id) {
   const taskRecord = tasks.find(t => id ? t.id === id : !id) || data;
   sbUpsert('tasks', { ...taskRecord, scope: sc }).catch(() => { });
   if (!id && assigneeUid && assigneeUid !== currentUser?.id) {
-    Promise.resolve(supa.from('notifications').insert({
+    supa.from('notifications').insert({
       user_id: assigneeUid, type: 'task_assigned',
       title: '📋 New task assigned to you: ' + title,
       body: 'Due: ' + (data.due || 'TBD')
-    })).catch(() => { });
+    }).catch(() => { });
     showToast('Task created + ' + assigneeName + ' notified ✓');
   } else {
     showToast(id ? 'Task updated' : 'Task created');
   }
   closeModal(); renderPage('tasks');
 }
-function openAddTask(status = 'todo') {
-  openModal('New Task', taskForm({ status }), () => saveTask(null), 'Create Task');
-  setTimeout(() => populateAssigneeDropdown(''), 200);
-}
+function openAddTask(status = 'todo') { openModal('New Task', taskForm({ status }), () => saveTask(null), 'Create Task') }
 function openEditTask(id) {
   const sc = scopeKey(); const tasks = DB.get('tasks_' + sc) || []; const t = tasks.find(x => x.id === id); if (!t) return;
   openModal('Edit Task', taskForm(t), () => saveTask(id), 'Save Task', `<button class="btn btn-danger" onclick="deleteTask('${id}')">Delete</button>`);
@@ -2257,7 +2226,7 @@ function lastNMonths(ym, n) {
 function getDiscs() { return DB.get('disc_' + getSalesSc()) || [] }
 function setDiscs(v) { DB.set('disc_' + getSalesSc(), v) }
 function getFinProds() { const fd = DB.get('finance_' + getSalesSc()) || { products: [] }; return fd.products || [] }
-function getSD() { return getSalesObj(getSalesSc(), { kpi: 100, kpi_unit: 'units' }) }
+function getSD() { return DB.get('sales_' + getSalesSc()) || { kpi: 100, kpi_unit: 'units', entries: [] } }
 function setSD(v) { DB.set('sales_' + getSalesSc(), v) }
 
 function calcEntryAmounts(entry) {
