@@ -911,6 +911,88 @@
    opacity: 1
  }
 
+ /* Spinner + global loading */
+ @keyframes spin {
+   to { transform: rotate(360deg) }
+ }
+
+ .spinner {
+   display: inline-block;
+   width: 14px;
+   height: 14px;
+   border: 2px solid rgba(255, 255, 255, 0.3);
+   border-top-color: currentColor;
+   border-radius: 50%;
+   animation: spin 0.7s linear infinite;
+   flex-shrink: 0
+ }
+
+ .btn.btn-loading {
+   opacity: 0.75;
+   cursor: default;
+   pointer-events: none
+ }
+
+ .btn.btn-loading .spinner {
+   margin-right: 2px
+ }
+
+ #global-loading {
+   position: fixed;
+   inset: 0;
+   z-index: 9998;
+   background: rgba(10, 10, 14, 0.35);
+   display: none;
+   align-items: center;
+   justify-content: center;
+   backdrop-filter: blur(1px)
+ }
+
+ #global-loading.show {
+   display: flex
+ }
+
+ .gl-box {
+   background: var(--bg2);
+   border: 1px solid var(--border2);
+   border-radius: var(--r2);
+   padding: 14px 20px;
+   display: flex;
+   align-items: center;
+   gap: 10px;
+   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+   font-size: 12px;
+   color: var(--text)
+ }
+
+ .gl-box .spinner {
+   border: 2px solid var(--border2);
+   border-top-color: var(--accent);
+   width: 16px;
+   height: 16px
+ }
+
+ #top-progress {
+   position: fixed;
+   top: 0;
+   left: 0;
+   height: 2px;
+   width: 0%;
+   background: var(--accent);
+   z-index: 9999;
+   transition: width 0.2s ease, opacity 0.2s ease;
+   opacity: 0
+ }
+
+ #top-progress.show {
+   opacity: 1;
+   width: 70%
+ }
+
+ #top-progress.done {
+   width: 100%
+ }
+
  /* Delete */
  .del {
    background: transparent;
@@ -1013,6 +1095,25 @@
  .task-card:hover {
    border-color: var(--border2);
    transform: translateY(-1px)
+ }
+
+ .task-card.task-priority {
+   border-color: var(--amber);
+   background: linear-gradient(180deg, rgba(255, 176, 32, 0.08), transparent 40%), var(--bg2)
+ }
+
+ .priority-badge {
+   display: inline-flex;
+   align-items: center;
+   gap: 3px;
+   font-size: 9px;
+   font-weight: 700;
+   letter-spacing: .03em;
+   color: #1a1200;
+   background: var(--amber);
+   padding: 2px 7px;
+   border-radius: 8px;
+   margin-bottom: 6px
  }
 
  .task-card-title {

@@ -8,6 +8,7 @@ const { createClient } = window.supabase;
 const supa = createClient(SUPA_URL, SUPA_KEY);
 
 // ── Current session state ──
+const OWNER_EMAIL = 'dlazuardi4@gmail.com'; // the account that always has full admin access
 let currentUser = null;      // auth.user
 let currentProfile = null;   // profiles row
 let userBusinesses = [];     // user_businesses rows
@@ -50,6 +51,12 @@ async function initAuth() {
 async function onSignedIn(user) {
   currentUser = user;
 
+  // Determine owner status up-front from the email — this never depends on a
+  // network call, so the owner can NEVER be locked out of their own tools by a
+  // slow/failed profile fetch. The Supabase profile is still checked below and
+  // can only ever UPGRADE (not downgrade) this.
+  isOwner = (user.email || '').toLowerCase() === OWNER_EMAIL;
+
   // Hide login, show app immediately
   const ls = document.getElementById('login-screen');
   ls.classList.add('fade-out');
@@ -77,13 +84,14 @@ async function onSignedIn(user) {
       currentProfile = {
         id: user.id,
         name: user.email || "User",
-        role: "member"
+        role: isOwner ? "owner" : "member"
       };
-
-      isOwner = false;
+      // NOTE: do not touch isOwner here — the email check above is authoritative
+      // for the owner account, so a failed profile fetch cannot strip access.
     } else {
       currentProfile = prof;
-      isOwner = prof.role === 'owner';
+      // Owner if the DB says so OR the email matches — email wins, never downgrades.
+      isOwner = isOwner || prof.role === 'owner';
     }
 
     // Fetch business assignments for crew
@@ -254,9 +262,13 @@ async function doLogin() {
   const email = document.getElementById('login-email').value.trim();
   const password = document.getElementById('login-password').value;
   if (!email || !password) return showLoginError('Please enter email and password');
+  const btn = document.getElementById('login-submit-btn');
+  const originalLabel = btn?.innerHTML;
+  if (btn) { btn.classList.add('btn-loading'); btn.innerHTML = `<span class="spinner"></span> Signing in…`; }
   document.getElementById('login-loading').style.display = 'block';
   const { error } = await supa.auth.signInWithPassword({ email, password });
   document.getElementById('login-loading').style.display = 'none';
+  if (btn) { btn.classList.remove('btn-loading'); btn.innerHTML = originalLabel; }
   if (error) showLoginError(error.message);
 }
 
@@ -313,6 +325,10 @@ async function doAcceptInvite() {
   const name = document.getElementById('inv-name').value.trim();
   const password = document.getElementById('inv-password').value;
   if (!name || password.length < 8) return showLoginError('Name required and password must be at least 8 characters');
+  const btn = document.getElementById('invite-submit-btn');
+  const originalLabel = btn?.innerHTML;
+  const stopLoading = () => { document.getElementById('login-loading').style.display = 'none'; if (btn) { btn.classList.remove('btn-loading'); btn.innerHTML = originalLabel; } };
+  if (btn) { btn.classList.add('btn-loading'); btn.innerHTML = `<span class="spinner"></span> Creating account…`; }
   document.getElementById('login-loading').style.display = 'block';
 
   // Sign up
@@ -321,8 +337,8 @@ async function doAcceptInvite() {
     password,
     options: { data: { name, role: 'member' } }
   });
-  if (error) { document.getElementById('login-loading').style.display = 'none'; showLoginError(error.message); return; }
-  if (!user) { document.getElementById('login-loading').style.display = 'none'; showLoginError('Signup failed — please try again.'); return; }
+  if (error) { stopLoading(); showLoginError(error.message); return; }
+  if (!user) { stopLoading(); showLoginError('Signup failed — please try again.'); return; }
   // Wait briefly for auth to settle
   await new Promise(r => setTimeout(r, 1000));
 
@@ -341,12 +357,12 @@ async function doAcceptInvite() {
     }
     console.log('user_businesses inserted:', successCount, '/', positions.length);
     if (successCount === 0 && positions.length > 0) {
-      document.getElementById('login-loading').style.display = 'none';
+      stopLoading();
       showLoginError('Account created but role assignment failed. Contact the owner.');
       return;
     }
   }
-  document.getElementById('login-loading').style.display = 'none';
+  stopLoading();
   showLogin();
   showLoginError('Account created! Sign in now.');
   document.getElementById('login-error').style.color = 'var(--green)';
@@ -473,12 +489,27 @@ async function loadNotifications() {
   if (!list) return;
   list.innerHTML = notifs.length ? notifs.map(n => `
     <div style="padding:10px 14px;border-bottom:1px solid var(--border);background:${n.read ? '' : 'var(--accentbg)'};display:flex;align-items:flex-start;gap:8px">
-      <div style="flex:1;cursor:pointer" onclick="markRead('${n.id}')">
+      <div style="flex:1;cursor:${n.link ? 'pointer' : 'default'}" onclick="openNotif('${n.id}','${n.link || ''}')">
         <div style="font-size:12px;font-weight:${n.read ? 400 : 600};color:var(--text)">${n.title}</div>
         <div style="font-size:10px;color:var(--text3);margin-top:2px">${n.body || ''} · ${new Date(n.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</div>
       </div>
       <button onclick="clearNotif('${n.id}')" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:0 2px;flex-shrink:0;line-height:1" title="Clear">×</button>
     </div>`).join('') : '<div style="padding:20px;text-align:center;font-size:12px;color:var(--text3)">No notifications</div>';
+}
+
+// Click a notif card: mark read, close the panel, and deep-link into the relevant module
+async function openNotif(id, link) {
+  await markRead(id);
+  if (!link || !canAccessPage(link)) return;
+  closeNotifPanel();
+  const navItem = document.querySelector(`.nav-item[data-page="${link}"]`);
+  if (navItem) goPage(navItem, link);
+  else { currentPage = link; renderPage(link); }
+}
+
+function closeNotifPanel() {
+  const panel = document.getElementById('notif-panel');
+  if (panel) panel.style.display = 'none';
 }
 
 async function clearNotif(id) {
@@ -532,12 +563,12 @@ async function sendNotification(userId, title, body, link = '') {
 }
 
 // Send to all users in a department for a scope
-async function notifyDept(scope, dept, title, body) {
+async function notifyDept(scope, dept, title, body, link = '') {
   const bizId = scope.replace('oase_brand', 'oase').replace(/^oase_.+/, 'oase');
   const { data: ubs } = await supa.from('user_businesses')
     .select('user_id').eq('business_id', bizId).eq('department', dept);
   if (!ubs) return;
-  await Promise.all(ubs.map(ub => sendNotification(ub.user_id, title, body)));
+  await Promise.all(ubs.map(ub => sendNotification(ub.user_id, title, body, link)));
 }
 
 // ═══════════════════════════════════════════════════
@@ -658,12 +689,16 @@ const CF_CAT_DEFAULT = {
 // ═══════════════════════════════════════════════════
 // ── SUPABASE TABLE MAPPING ──
 const SUPABASE_TABLES = {
-  // localStorage key prefix → { table, scope_field, is_array }
+  // localStorage key prefix → { table, scoped }
+  // IMPORTANT: only keys whose cached value is a FLAT ARRAY of rows may live here.
+  // `sales_` and `finance_` are deliberately EXCLUDED — they are stored as structured
+  // objects ({kpi, entries:[]} / {products:[], cashflow:[]}) and have their own sync
+  // paths (sbUpsert in saveSale + syncScopeData / _pullFinance). Adding them here made
+  // pullScope overwrite the object with a flat array and crash every page that read it.
   'tasks_': { table: 'tasks', scoped: true },
   'notes_': { table: 'notes', scoped: true },
   'calendar': { table: 'calendar_events', scoped: true },
   'mkt_': { table: 'marketing_posts', scoped: true },
-  'sales_': { table: 'sale_entries', scoped: true },
   'rundowns_': { table: 'rundowns', scoped: true },
   'production_': { table: 'production_orders', scoped: true },
   'vendors_': { table: 'vendors', scoped: true },
@@ -749,9 +784,18 @@ const DB = {
     await Promise.allSettled(pulls.map(async ({ key, table, scope }) => {
       try {
         const { data } = await supa.from(table).select('*').eq('scope', scope);
-        if (data) {   // write even when [] so an emptied scope clears the stale cache
-          localStorage.setItem('lazymodes_' + key, JSON.stringify(data));
+        if (!data) return;
+        // SAFETY: never overwrite a structured-object cache with a flat array.
+        // If the existing cached value is a non-array object, the app reads it as
+        // an object ({entries:[]} etc.) and a raw array pull would corrupt it.
+        const existingRaw = localStorage.getItem('lazymodes_' + key);
+        if (existingRaw) {
+          try {
+            const existing = JSON.parse(existingRaw);
+            if (existing && !Array.isArray(existing) && typeof existing === 'object') return;
+          } catch (e) { }
         }
+        localStorage.setItem('lazymodes_' + key, JSON.stringify(data)); // write even [] to clear stale cache
       } catch (e) { }
     }));
     // Pull finance data
@@ -1248,7 +1292,9 @@ async function setActiveBiz(id) {
   renderPage(currentPage);
   const sc = scopeKey();
   if (sc) {
+    showTopProgress();
     try { await DB.pullScope(sc); } catch (e) { console.warn('pullScope failed:', e.message); }
+    hideTopProgress();
     renderSidebar();
     renderPage(currentPage);
   }
@@ -1261,7 +1307,9 @@ async function switchBiz(id) {
   renderPage('dashboard');
   const sc = scopeKey();
   if (sc) {
+    showTopProgress();
     try { await DB.pullScope(sc); } catch (e) { console.warn('pullScope failed:', e.message); }
+    hideTopProgress();
     renderSidebar();
     renderPage('dashboard');
   }
@@ -1279,7 +1327,9 @@ async function setOaseProj(id) {
   renderPage(currentPage);
   const sc = scopeKey();
   if (sc) {
+    showTopProgress();
     try { await DB.pullScope(sc); } catch (e) { console.warn('pullScope failed:', e.message); }
+    hideTopProgress();
     renderSidebar();
     renderPage(currentPage);
   }
@@ -1306,7 +1356,9 @@ function goPage(el, page) {
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   el.classList.add('active');
   currentPage = page;
+  showTopProgress();
   renderPage(page);
+  hideTopProgress();
 }
 function renderPage(page) {
   const titles = { dashboard: 'Dashboard', calendar: 'Calendar', notes: 'Brainstorm', tasks: 'Tasks', marketing: 'Marketing', sales: 'Sales & Inquiry', finance: 'Finance', rundown: 'Rundown', production: 'Production Tracker', vendors: 'Vendors', assets: 'Assets & Inventory', documents: 'Documents' };
@@ -1322,7 +1374,18 @@ function renderPage(page) {
     document.getElementById('tb-biz-name').textContent = p === 'brand' ? 'OASE (Brand)' : 'OASE: ' + (proj?.name || p);
   }
   const pages = { dashboard: pgDashboard, calendar: pgCalendar, notes: pgNotes, tasks: pgTasks, marketing: pgMarketing, sales: pgSales, finance: pgFinance, rundown: pgRundown, production: pgProduction, vendors: pgVendors, assets: pgAssets, documents: pgDocuments };
-  (pages[page] || pgDashboard)(c, tb);
+  try {
+    (pages[page] || pgDashboard)(c, tb);
+  } catch (e) {
+    // A single bad page must never blank the whole app or block navigation.
+    console.error('renderPage error on "' + page + '":', e);
+    c.innerHTML = `<div class="empty" style="padding:40px 20px">
+      <div class="empty-icon">⚠</div>
+      <p style="margin-bottom:4px">Couldn't load ${titles[page] || page}.</p>
+      <p style="font-size:11px;color:var(--text3);margin-bottom:14px">${esc(e.message || 'Unexpected error')}</p>
+      <button class="btn btn-primary btn-sm" onclick="renderPage('${page}')">Retry</button>
+    </div>`;
+  }
   requestAnimationFrame(animateRings);
 }
 
@@ -1349,7 +1412,7 @@ function pgDashboard(c, tb) {
   const notes = DB.get('notes_' + sc) || [];
   const allEvents = DB.get('calendar') || [];
   const upcoming = allEvents.filter(e => e.date >= now.toISOString().split('T')[0]).sort((a, b) => a.date > b.date ? 1 : -1).slice(0, 4);
-  const sales = DB.get('sales_' + sc) || { kpi: 0, kpi_unit: '', entries: [] };
+  const sales = normalizeSD(DB.get('sales_' + sc));
   const closedSales = sales.entries.filter(e => e.status === 'closed').length;
   const kpiPct = sales.kpi ? Math.min(100, Math.round(closedSales / sales.kpi * 100)) : 0;
 
@@ -1518,7 +1581,7 @@ function openAddEvent() {
       if (inviteeIds.length && currentUser) {
         for (const uid of inviteeIds) {
           if (uid === currentUser.id) continue;
-          supa.from('notifications').insert({ user_id: uid, type: 'calendar_invite', title: '📅 You were invited: ' + title, body: 'Date: ' + date + (ev.desc ? ' · ' + ev.desc : '') }).catch(() => { });
+          supa.from('notifications').insert({ user_id: uid, type: 'calendar_invite', title: '📅 You were invited: ' + title, body: 'Date: ' + date + (ev.desc ? ' · ' + ev.desc : ''), link: 'calendar' }).catch(() => { });
         }
       }
       const gcalUrl = `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(title)}&dates=${date.replace(/-/g, '')}/${date.replace(/-/g, '')}&details=${encodeURIComponent(ev.desc || '')}`;
@@ -1618,7 +1681,8 @@ function pgTasks(c, tb) {
   const tasks = DB.get('tasks_' + sc) || [];
   const cols = [{ k: 'todo', label: 'To Do' }, { k: 'inprogress', label: 'In Progress' }, { k: 'done', label: 'Done' }];
   c.innerHTML = `<div class="kanban">${cols.map(col => {
-    const ts = tasks.filter(t => t.status === col.k);
+    const ts = tasks.filter(t => t.status === col.k)
+      .sort((a, b) => (b.priority ? 1 : 0) - (a.priority ? 1 : 0) || (a.due || '9999').localeCompare(b.due || '9999'));
     return `<div>
       <div class="kan-col-head">
         <span class="kan-col-label">${col.label}</span>
@@ -1630,12 +1694,14 @@ function pgTasks(c, tb) {
   }).join('')}</div>`;
 }
 function renderTaskCard(t) {
-  return `<div class="task-card" onclick="openEditTask('${t.id}')">
+  return `<div class="task-card${t.priority ? ' task-priority' : ''}" onclick="openEditTask('${t.id}')">
+    ${t.priority ? `<div class="priority-badge">⚡ Priority</div>` : ''}
     <div class="task-card-title">${t.title}</div>
     ${t.desc ? `<div class="task-card-desc">${t.desc}</div>` : ''}
     ${t.img ? `<img src="${t.img}" class="task-img" onerror="this.style.display='none'">` : ''}
     <div class="task-meta">
       ${t.assignee ? `<span class="task-meta-chip">@${t.assignee}</span>` : ''}
+      ${(t.cc || []).map(m => `<span class="task-meta-chip">cc @${m.name}</span>`).join('')}
       ${t.due ? `<span class="task-meta-chip">📅 ${t.due}</span>` : ''}
       <span class="pill ${t.status === 'done' ? 'pill-green' : t.status === 'inprogress' ? 'pill-amber' : 'pill-gray'} ">${t.status === 'todo' ? 'To Do' : t.status === 'inprogress' ? 'In Progress' : 'Done'}</span>
     </div>
@@ -1659,6 +1725,13 @@ function taskForm(t = {}) {
       <option value="inprogress"${t.status === 'inprogress' ? ' selected' : ''}>In Progress</option>
       <option value="done"${t.status === 'done' ? ' selected' : ''}>Done</option>
     </select></div>
+    ${isOwner ? `<div class="form-row"><label style="display:flex;align-items:center;gap:7px;cursor:pointer">
+      <input type="checkbox" id="tk-priority" ${t.priority ? 'checked' : ''} style="accent-color:var(--amber);width:14px;height:14px">
+      <span>⚡ Mark as Priority</span>
+    </label></div>` : ''}
+    <div class="form-row"><label>Tag other members (cc, optional)</label>
+      <div id="tk-cc-wrap" style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:8px 10px;font-size:12px;color:var(--text3)">Loading…</div>
+    </div>
     <div class="form-row">
       <label>Benchmark Image</label>
       <div class="img-drop" id="task-img-drop" onclick="document.getElementById('task-img-input').click()">
@@ -1683,29 +1756,68 @@ async function saveTask(id) {
   const sc = scopeKey(); const tasks = DB.get('tasks_' + sc) || [];
   const assigneeName = document.getElementById('tk-assign')?.value.trim() || '';
   const assigneeUid = getAssigneeUid(assigneeName);
-  const data = { title, desc: document.getElementById('tk-desc').value.trim(), assignee: assigneeName, assignee_uid: assigneeUid || '', due: document.getElementById('tk-due').value, status: document.getElementById('tk-status').value, img: document.getElementById('task-img-data').value };
+  const priorityEl = document.getElementById('tk-priority');
+  const priority = priorityEl ? priorityEl.checked : (id ? (tasks.find(t => t.id === id)?.priority || false) : false);
+  const cc = [...document.querySelectorAll('.tk-cc-check:checked')].map(c => ({ uid: c.dataset.uid, name: c.dataset.name }));
+  const data = { title, desc: document.getElementById('tk-desc').value.trim(), assignee: assigneeName, assignee_uid: assigneeUid || '', due: document.getElementById('tk-due').value, status: document.getElementById('tk-status').value, img: document.getElementById('task-img-data').value, priority, cc };
   if (id) { const i = tasks.findIndex(t => t.id === id); if (i > -1) tasks[i] = { ...tasks[i], ...data } }
   else tasks.push({ id: 't' + Date.now(), ...data });
   DB.set('tasks_' + sc, tasks);
   const taskRecord = tasks.find(t => id ? t.id === id : !id) || data;
   sbUpsert('tasks', { ...taskRecord, scope: sc }).catch(() => { });
-  if (!id && assigneeUid && assigneeUid !== currentUser?.id) {
-    supa.from('notifications').insert({
-      user_id: assigneeUid, type: 'task_assigned',
-      title: '📋 New task assigned to you: ' + title,
-      body: 'Due: ' + (data.due || 'TBD')
-    }).catch(() => { });
-    showToast('Task created + ' + assigneeName + ' notified ✓');
+  if (!id) {
+    let notifiedCount = 0;
+    if (assigneeUid && assigneeUid !== currentUser?.id) {
+      notifiedCount++;
+      supa.from('notifications').insert({
+        user_id: assigneeUid, type: 'task_assigned',
+        title: '📋 New task assigned to you: ' + title,
+        body: 'Due: ' + (data.due || 'TBD'),
+        link: 'tasks'
+      }).catch(() => { });
+    }
+    const ccToNotify = cc.filter(m => m.uid && m.uid !== currentUser?.id && m.uid !== assigneeUid);
+    ccToNotify.forEach(m => {
+      notifiedCount++;
+      supa.from('notifications').insert({
+        user_id: m.uid, type: 'task_tagged',
+        title: '📋 You were tagged on a task: ' + title,
+        body: 'Assigned to ' + (assigneeName || 'unassigned') + ' · Due: ' + (data.due || 'TBD'),
+        link: 'tasks'
+      }).catch(() => { });
+    });
+    showToast(notifiedCount ? 'Task created + ' + notifiedCount + ' member(s) notified ✓' : 'Task created');
   } else {
-    showToast(id ? 'Task updated' : 'Task created');
+    showToast('Task updated');
   }
   closeModal(); renderPage('tasks');
 }
-function openAddTask(status = 'todo') { openModal('New Task', taskForm({ status }), () => saveTask(null), 'Create Task') }
+function openAddTask(status = 'todo') {
+  openModal('New Task', taskForm({ status }), () => saveTask(null), 'Create Task');
+  setTimeout(() => { populateAssigneeDropdown(''); populateTaskCc([]); }, 200);
+}
 function openEditTask(id) {
   const sc = scopeKey(); const tasks = DB.get('tasks_' + sc) || []; const t = tasks.find(x => x.id === id); if (!t) return;
   openModal('Edit Task', taskForm(t), () => saveTask(id), 'Save Task', `<button class="btn btn-danger" onclick="deleteTask('${id}')">Delete</button>`);
-  setTimeout(() => populateAssigneeDropdown(t.assignee || ''), 200);
+  setTimeout(() => { populateAssigneeDropdown(t.assignee || ''); populateTaskCc((t.cc || []).map(m => m.uid)); }, 200);
+}
+async function populateTaskCc(selectedUids) {
+  const wrap = document.getElementById('tk-cc-wrap'); if (!wrap) return;
+  const bizId = getActiveBiz()?.id || '';
+  try {
+    const { data: ubs } = await supa.from('user_businesses').select('user_id').eq('business_id', bizId);
+    const uids = [...new Set((ubs || []).map(u => u.user_id))].filter(u => u !== currentUser?.id);
+    if (!uids.length) { wrap.textContent = 'No other team members in this business yet'; return; }
+    const { data: profs } = await supa.from('profiles').select('id,name,initials').in('id', uids);
+    const members = (profs || []).map(p => ({ uid: p.id, name: p.name || p.initials || '?' }));
+    if (!members.length) { wrap.textContent = 'No other team members found'; return; }
+    wrap.innerHTML = members.map(m => `<label style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:12px;color:var(--text2)">
+      <input type="checkbox" class="tk-cc-check" data-uid="${m.uid}" data-name="${esc(m.name)}" style="accent-color:var(--accent);width:14px;height:14px" ${selectedUids.includes(m.uid) ? 'checked' : ''}>
+      <span>${m.name}</span>
+    </label>`).join('');
+  } catch (e) {
+    wrap.textContent = 'Could not load members';
+  }
 }
 async function populateAssigneeDropdown(currentVal) {
   const sel = document.getElementById('tk-assign-sel'); if (!sel) return;
@@ -2226,7 +2338,15 @@ function lastNMonths(ym, n) {
 function getDiscs() { return DB.get('disc_' + getSalesSc()) || [] }
 function setDiscs(v) { DB.set('disc_' + getSalesSc(), v) }
 function getFinProds() { const fd = DB.get('finance_' + getSalesSc()) || { products: [] }; return fd.products || [] }
-function getSD() { return DB.get('sales_' + getSalesSc()) || { kpi: 100, kpi_unit: 'units', entries: [] } }
+function getSD() { return normalizeSD(DB.get('sales_' + getSalesSc())); }
+// Coerce any legacy/corrupted sales cache back into the expected object shape.
+// A previous version could leave a flat array here (see SUPABASE_TABLES note),
+// so we heal it instead of letting `.entries` be undefined and crash the page.
+function normalizeSD(v) {
+  if (Array.isArray(v)) return { kpi: 100, kpi_unit: 'units', entries: v };
+  if (!v || typeof v !== 'object') return { kpi: 100, kpi_unit: 'units', entries: [] };
+  return { kpi: v.kpi ?? 100, kpi_unit: v.kpi_unit || 'units', entries: Array.isArray(v.entries) ? v.entries : [] };
+}
 function setSD(v) { DB.set('sales_' + getSalesSc(), v) }
 
 function calcEntryAmounts(entry) {
@@ -2741,7 +2861,7 @@ function saveSale(id) {
     sbUpsert('sale_entries', { ...entry, scope: getSalesSc() }).catch(() => { });
     // Notify finance dept if status closed + receipt uploaded
     if (entry.status === 'closed' && entry.receipt_img && entry.receipt_status === 'pending') {
-      notifyDept(getSalesSc(), 'Finance', 'Receipt Pending Approval', entry.name + ' — Rp ' + fmtN(calcEntryAmounts(entry).final)).catch(() => { });
+      notifyDept(getSalesSc(), 'Finance', 'Receipt Pending Approval', entry.name + ' — Rp ' + fmtN(calcEntryAmounts(entry).final), 'finance').catch(() => { });
     }
   }
   closeModal(); renderPage('sales'); showToast('Entry saved');
@@ -3500,7 +3620,24 @@ function openModal(title, body, onConfirm, confirmLabel = 'Save', extraButtons =
   document.getElementById('modal').className = 'modal' + (large ? ' modal-lg' : '');
   const foot = document.getElementById('modal-foot');
   foot.innerHTML = `${extraButtons}<button class="btn btn-ghost" onclick="closeModal()">Cancel</button><button class="btn btn-primary" id="modal-confirm">${confirmLabel}</button>`;
-  document.getElementById('modal-confirm').onclick = onConfirm;
+  const confirmBtn = document.getElementById('modal-confirm');
+  if (typeof onConfirm === 'function') {
+    confirmBtn.onclick = async function () {
+      const originalLabel = confirmBtn.innerHTML;
+      confirmBtn.classList.add('btn-loading');
+      confirmBtn.innerHTML = `<span class="spinner"></span> Saving…`;
+      try {
+        await onConfirm();
+      } finally {
+        if (document.getElementById('modal-confirm') === confirmBtn) {
+          confirmBtn.classList.remove('btn-loading');
+          confirmBtn.innerHTML = originalLabel;
+        }
+      }
+    };
+  } else {
+    confirmBtn.onclick = null;
+  }
   document.getElementById('overlay').classList.add('open');
 }
 function closeModal() { document.getElementById('overlay').classList.remove('open') }
@@ -3519,6 +3656,32 @@ function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&
 function showToast(msg, dur = 2500) {
   const t = document.getElementById('toast'); t.textContent = msg; t.classList.add('show');
   clearTimeout(t._to); t._to = setTimeout(() => t.classList.remove('show'), dur);
+}
+
+// ── Global loading indicators ──
+let _loadingDepth = 0;
+function showLoading(msg = 'Loading…') {
+  _loadingDepth++;
+  const msgEl = document.getElementById('gl-msg'); if (msgEl) msgEl.textContent = msg;
+  document.getElementById('global-loading')?.classList.add('show');
+}
+function hideLoading() {
+  _loadingDepth = Math.max(0, _loadingDepth - 1);
+  if (_loadingDepth > 0) return;
+  document.getElementById('global-loading')?.classList.remove('show');
+}
+function showTopProgress() {
+  const el = document.getElementById('top-progress'); if (!el) return;
+  el.classList.remove('done'); el.style.width = '0%';
+  requestAnimationFrame(() => el.classList.add('show'));
+}
+function hideTopProgress() {
+  const el = document.getElementById('top-progress'); if (!el) return;
+  // Small delay so the bar is always perceptible, even when a render is instant.
+  setTimeout(() => {
+    el.classList.add('done');
+    setTimeout(() => { el.classList.remove('show', 'done'); el.style.width = '0%'; }, 250);
+  }, 150);
 }
 
 function compressImage(file, maxW, quality, cb) {
@@ -4279,7 +4442,7 @@ function openFinanceExecute(id) {
       fd.cashflow.unshift({ id: 'c' + Date.now(), date: new Date().toISOString().split('T')[0], desc: (isPR ? d.title : d.title || d.ref) + ' (' + d.ref + ')', type: 'out', amount: total, category: d.category || 'Other Expense', from_doc: id });
       DB.set('finance_' + sc, fd);
       // Notify submitter
-      if (d.created_by) { sendNotification(d.created_by, 'Payment Executed', 'Your ' + d.ref + ' has been processed and receipt uploaded.').catch(() => { }); }
+      if (d.created_by) { sendNotification(d.created_by, 'Payment Executed', 'Your ' + d.ref + ' has been processed and receipt uploaded.', 'documents').catch(() => { }); }
       sbUpsert('documents', { ...d, scope: getOpsSc() }).catch(() => { });
       closeModal(); renderPage('documents'); showToast('Payment executed — Finance cashflow updated ✓');
     }, 'Mark as Executed');
@@ -4318,7 +4481,7 @@ function openNewDoc(type) {
         // Notify owner
         if (currentUser && isOwner === false) {
           supa.from('profiles').select('id').eq('role', 'owner').then(({ data }) => {
-            if (data) data.forEach(o => sendNotification(o.id, 'Payment Request Submitted', title + ' — Rp ' + fmtN(parseInt(document.getElementById('nd-amount')?.value) || 0)));
+            if (data) data.forEach(o => sendNotification(o.id, 'Payment Request Submitted', title + ' — Rp ' + fmtN(parseInt(document.getElementById('nd-amount')?.value) || 0), 'documents'));
           });
         }
         closeModal(); renderPage('documents'); showToast('Payment request submitted');

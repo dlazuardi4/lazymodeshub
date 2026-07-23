@@ -41,7 +41,7 @@
             autocomplete="email"></div>
         <div class="form-row"><label>Password</label><input id="login-password" type="password" placeholder="••••••••"
             autocomplete="current-password"></div>
-        <button class="btn btn-primary" style="width:100%;padding:10px;font-size:13px;margin-top:4px"
+        <button class="btn btn-primary" id="login-submit-btn" style="width:100%;padding:10px;font-size:13px;margin-top:4px"
           onclick="doLogin()">Sign In</button>
         <div style="text-align:center;margin-top:14px">
           <a onclick="showForgot()"
@@ -64,7 +64,7 @@
         <div class="form-row"><label>Your Name</label><input id="inv-name" placeholder="Full name"></div>
         <div class="form-row"><label>Password</label><input id="inv-password" type="password"
             placeholder="Choose a password (min 8 chars)"></div>
-        <button class="btn btn-primary" style="width:100%;padding:10px;font-size:13px" onclick="doAcceptInvite()">Create
+        <button class="btn btn-primary" id="invite-submit-btn" style="width:100%;padding:10px;font-size:13px" onclick="doAcceptInvite()">Create
           Account</button>
       </div>
       <p id="login-loading" style="display:none;text-align:center;font-size:12px;color:var(--text3);margin-top:12px">
@@ -202,6 +202,12 @@
   </div>
 
   <div class="toast" id="toast"></div>
+
+  <!-- GLOBAL LOADING -->
+  <div id="top-progress"></div>
+  <div id="global-loading">
+    <div class="gl-box"><span class="spinner"></span><span id="gl-msg">Loading…</span></div>
+  </div>
 
   <!-- Link ke file JavaScript eksternal (loaded last, so page elements exist first) -->
   <script src="app.js"></script>
