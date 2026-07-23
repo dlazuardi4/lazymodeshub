@@ -1116,6 +1116,34 @@
    margin-bottom: 6px
  }
 
+ .task-card.task-overdue {
+   border-color: var(--red)
+ }
+
+ .task-meta-chip.chip-overdue {
+   background: var(--redbg);
+   color: var(--red);
+   font-weight: 600
+ }
+
+ .mt-row {
+   display: flex;
+   align-items: center;
+   gap: 8px;
+   padding: 9px 4px;
+   border-bottom: 1px solid var(--border);
+   cursor: pointer;
+   transition: background var(--ease)
+ }
+
+ .mt-row:last-child {
+   border-bottom: none
+ }
+
+ .mt-row:hover {
+   background: var(--bg3)
+ }
+
  .task-card-title {
    font-size: 12px;
    font-weight: 600;

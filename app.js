@@ -130,7 +130,9 @@ async function onSignedIn(user) {
   }
 
   subscribeNotifications();
+  subscribeScopeData();
   loadNotifications();
+  showDailyDigest();
 }
 
 // ── INVITE EMAIL via mailto fallback ──
@@ -477,6 +479,53 @@ function subscribeNotifications() {
     .subscribe();
 }
 
+// ── Realtime for shared data (tasks + calendar) ──
+// So a teammate's change shows up without a manual reload. Debounced, and only
+// re-renders when you're actually looking at the affected page.
+let _scopeChannel = null;
+const _remoteRefreshTimers = {};
+function subscribeScopeData() {
+  if (!currentUser || typeof supa === 'undefined') return;
+  if (_scopeChannel) { try { supa.removeChannel(_scopeChannel); } catch (e) { } _scopeChannel = null; }
+  _scopeChannel = supa.channel('scope-data-' + Date.now())
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'tasks' }, p => onRemoteDataChange('tasks', p))
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'calendar_events' }, p => onRemoteDataChange('calendar', p))
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'task_comments' }, p => onRemoteCommentChange(p))
+    .subscribe();
+}
+function onRemoteDataChange(kind, payload) {
+  // Ignore changes for other businesses (tasks carry a scope column).
+  if (kind === 'tasks') {
+    const rowScope = payload?.new?.scope ?? payload?.old?.scope;
+    if (rowScope && rowScope !== scopeKey()) return;
+  }
+  clearTimeout(_remoteRefreshTimers[kind]);
+  _remoteRefreshTimers[kind] = setTimeout(async () => {
+    try {
+      if (kind === 'tasks') {
+        const sc = scopeKey(); if (sc) await pullTableScope('tasks', 'tasks_' + sc, sc);
+        if (currentPage === 'tasks' || currentPage === 'dashboard') renderPage(currentPage);
+      } else if (kind === 'calendar') {
+        await pullCalendar();
+        if (currentPage === 'calendar' || currentPage === 'dashboard') renderPage(currentPage);
+      }
+    } catch (e) { console.warn('remote refresh failed:', e.message); }
+  }, 400);
+}
+// Targeted single-table pull → localStorage, keeping the delete-baseline fresh.
+async function pullTableScope(table, key, scope) {
+  const { data } = await supa.from(table).select('*').eq('scope', scope);
+  if (!data) return;
+  localStorage.setItem('lazymodes_' + key, JSON.stringify(data));
+  DB._noteKnown(key, data);
+}
+async function pullCalendar() {
+  const { data } = await supa.from('calendar_events').select('*');
+  if (!data) return;
+  localStorage.setItem('lazymodes_calendar', JSON.stringify(data));
+  DB._noteKnown('calendar', data);
+}
+
 async function loadNotifications() {
   if (!currentUser) return;
   const { data } = await supa.from('notifications')
@@ -568,7 +617,121 @@ async function notifyDept(scope, dept, title, body, link = '') {
   const { data: ubs } = await supa.from('user_businesses')
     .select('user_id').eq('business_id', bizId).eq('department', dept);
   if (!ubs) return;
-  await Promise.all(ubs.map(ub => sendNotification(ub.user_id, title, body, link)));
+  await Promise.all(ubs.map(ub => sendNotification(ub.user_id, title, body, link).catch(() => { })));
+}
+
+// Send to every owner account (skips the actor automatically).
+async function notifyOwners(title, body, link = '') {
+  try {
+    const { data } = await supa.from('profiles').select('id').eq('role', 'owner');
+    (data || []).forEach(o => {
+      if (o.id !== currentUser?.id) sendNotification(o.id, title, body, link).catch(() => { });
+    });
+  } catch (e) { }
+}
+
+// ═══════════════════════════════════════════════════
+// ACTIVITY LOG — "who changed what, when"
+// ═══════════════════════════════════════════════════
+// Requires an `activity_log` table (see the SQL in ACTIVITY_COMMENTS_SETUP.sql).
+// If the table doesn't exist yet, this fails silently so nothing breaks.
+let _activityTableMissing = false;
+function logActivity(action, entity, title) {
+  if (!currentUser || _activityTableMissing || typeof supa === 'undefined') return;
+  supa.from('activity_log').insert({
+    scope: (typeof scopeKey === 'function' ? scopeKey() : '') || '',
+    user_id: currentUser.id,
+    user_name: currentProfile?.name || currentUser.email || 'Someone',
+    action, entity: entity || '', entity_title: (title || '').slice(0, 140)
+  }).then(({ error }) => {
+    if (error && /relation|does not exist|schema cache/i.test(error.message || '')) _activityTableMissing = true;
+  }).catch(() => { });
+}
+
+// ═══════════════════════════════════════════════════
+// DAILY DIGEST — once per day, on first open
+// ═══════════════════════════════════════════════════
+async function showDailyDigest() {
+  if (!currentUser) return;
+  const today = new Date().toISOString().split('T')[0];
+  const flag = 'digest_' + currentUser.id + '_' + today;
+  if (localStorage.getItem('lazymodes_' + flag)) return; // already shown today
+  try {
+    const { data } = await supa.from('tasks').select('title,due,status').eq('assignee_uid', currentUser.id);
+    const mine = (data || []).filter(t => t.status !== 'done');
+    const overdue = mine.filter(t => t.due && t.due < today).length;
+    const dueToday = mine.filter(t => t.due === today).length;
+    const events = (DB.get('calendar') || []).filter(e => e.date === today).length;
+    localStorage.setItem('lazymodes_' + flag, '1');
+    if (overdue || dueToday || events) {
+      const parts = [];
+      if (overdue) parts.push(overdue + ' overdue');
+      if (dueToday) parts.push(dueToday + ' due today');
+      if (events) parts.push(events + ' event' + (events > 1 ? 's' : '') + ' today');
+      setTimeout(() => showToast('☀ Good day! You have ' + parts.join(', ') + '. Tap “My Tasks”.', 6000), 1200);
+    }
+  } catch (e) { /* tasks table/columns may not be ready — skip quietly */ }
+}
+
+// ═══════════════════════════════════════════════════
+// TASK COMMENTS — discussion thread on a task
+// ═══════════════════════════════════════════════════
+// Requires a `task_comments` table (see ACTIVITY_COMMENTS_SETUP.sql). Degrades to a
+// friendly "not set up yet" message if the table is missing.
+async function loadTaskComments(taskId) {
+  const wrap = document.getElementById('tk-comments'); if (!wrap) return;
+  try {
+    const { data, error } = await supa.from('task_comments')
+      .select('*').eq('task_id', taskId).order('created_at', { ascending: true });
+    if (error) throw error;
+    const comments = data || [];
+    wrap.innerHTML = comments.length ? comments.map(cm => `
+      <div style="padding:7px 0;border-bottom:1px solid var(--border)">
+        <div style="display:flex;justify-content:space-between;gap:8px">
+          <span style="font-size:11px;font-weight:600;color:var(--text)">${esc(cm.user_name || 'Someone')}</span>
+          <span style="font-size:10px;color:var(--text3)">${new Date(cm.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</span>
+        </div>
+        <div style="font-size:12px;color:var(--text2);margin-top:2px;white-space:pre-wrap">${esc(cm.body)}</div>
+      </div>`).join('') : '<div style="font-size:11px;color:var(--text3);padding:4px 0">No comments yet. Start the discussion.</div>';
+  } catch (e) {
+    wrap.innerHTML = `<div style="font-size:11px;color:var(--text3);padding:4px 0">Comments aren't set up yet. Run ACTIVITY_COMMENTS_SETUP.sql in Supabase to enable them.</div>`;
+  }
+}
+async function addTaskComment(taskId) {
+  const input = document.getElementById('tk-comment-input'); if (!input) return;
+  const body = input.value.trim(); if (!body) return;
+  const btn = document.getElementById('tk-comment-btn');
+  if (btn) { btn.classList.add('btn-loading'); btn.innerHTML = '<span class="spinner"></span>'; }
+  try {
+    const { error } = await supa.from('task_comments').insert({
+      task_id: taskId, scope: scopeKey() || '',
+      user_id: currentUser.id, user_name: currentProfile?.name || currentUser.email || 'Someone',
+      body
+    });
+    if (error) throw error;
+    input.value = '';
+    await loadTaskComments(taskId);
+    // Notify the task's assignee + creator + cc (except me) that there's a new comment.
+    const t = (DB.get('tasks_' + scopeKey()) || []).find(x => x.id === taskId);
+    if (t) {
+      const who = new Set();
+      if (t.assignee_uid) who.add(t.assignee_uid);
+      if (t.created_by) who.add(t.created_by);
+      (t.cc || []).forEach(m => m.uid && who.add(m.uid));
+      who.delete(currentUser?.id);
+      who.forEach(uid => sendNotification(uid, '💬 New comment on: ' + t.title, (currentProfile?.name || 'Someone') + ': ' + body.slice(0, 80), 'tasks'));
+    }
+  } catch (e) {
+    showToast('Could not post comment — is it set up? ' + (e.message || ''), 4000);
+  } finally {
+    if (btn) { btn.classList.remove('btn-loading'); btn.innerHTML = 'Post'; }
+  }
+}
+// Realtime: if a comment lands on the task we're currently editing, refresh the thread.
+function onRemoteCommentChange(payload) {
+  const taskId = payload?.new?.task_id ?? payload?.old?.task_id;
+  const openId = document.getElementById('tk-comments')?.dataset.taskId;
+  if (taskId && openId && taskId === openId) loadTaskComments(taskId);
 }
 
 // ═══════════════════════════════════════════════════
@@ -634,7 +797,7 @@ function getMyDepts() {
 function canAccessPage(page) {
   if (isOwner) return true;
   if (!userBusinesses || !userBusinesses.length) {
-    return ['dashboard', 'calendar', 'tasks'].includes(page);
+    return ['dashboard', 'calendar', 'tasks', 'mytasks'].includes(page);
   }
   const depts = getMyDepts();
   const access = {
@@ -642,6 +805,7 @@ function canAccessPage(page) {
     calendar: ['Operations', 'Sales & Marketing', 'Finance'],
     notes: [],  // owner only
     tasks: ['Operations', 'Sales & Marketing', 'Finance'],
+    mytasks: ['Operations', 'Sales & Marketing', 'Finance'],
     marketing: ['Sales & Marketing'],
     sales: ['Sales & Marketing', 'Finance'],
     finance: ['Finance'],
@@ -745,16 +909,22 @@ const DB = {
     localStorage.removeItem('lazymodes_' + k);
     updateStorageBar();
   },
-  // KNOWN LIMITATION: whole-scope LWW — this pushes the entire scope array on every
-  // write with no per-row merge or updated_at guard. Two users editing the same
-  // business concurrently can overwrite each other's additions. Acceptable for
-  // single-user-per-business usage; revisit with per-row upsert/delete + updated_at
-  // guard, or Supabase RPC/Edge functions, before real multi-editor use.
+  // Per-key snapshot of the row ids we last knew about (in memory, per session).
+  // Used to make deletes concurrency-safe — see _push.
+  _known: {},
+  _noteKnown(k, arr) {
+    if (Array.isArray(arr)) DB._known[k] = new Set(arr.map(r => r && r.id).filter(Boolean));
+  },
+  // CONCURRENCY-SAFE PUSH. Previously this deleted every remote row in the scope that
+  // wasn't in our local copy — which meant a user with a stale cache would wipe rows a
+  // teammate had just added. Now we upsert our rows and only delete rows that WE
+  // ourselves had and then removed (tracked in _known), never rows we simply haven't
+  // cached yet. Combined with realtime pulls, teammates can no longer overwrite each other.
   async _push(k, v) {
     const cfg = _getTableConfig(k);
     if (!cfg || !Array.isArray(v)) return; // allow empty arrays so a full delete still runs
     const records = v.map(r => ({ ...r, scope: cfg.scope }));
-    const keepIds = new Set(records.map(r => r.id).filter(Boolean));
+    const currentIds = new Set(records.map(r => r.id).filter(Boolean));
 
     // 1) upsert current rows
     if (records.length) {
@@ -762,15 +932,16 @@ const DB = {
       if (error) { console.warn('Supabase upsert error:', cfg.table, error.message); return; }
     }
 
-    // 2) delete rows in this scope that are no longer present locally
-    const { data: existing, error: selErr } =
-      await supa.from(cfg.table).select('id').eq('scope', cfg.scope);
-    if (selErr) { console.warn('Supabase reconcile select error:', cfg.table, selErr.message); return; }
-    const toDelete = (existing || []).map(r => r.id).filter(id => !keepIds.has(id));
-    if (toDelete.length) {
-      const { error: delErr } = await supa.from(cfg.table).delete().in('id', toDelete);
-      if (delErr) console.warn('Supabase reconcile delete error:', cfg.table, delErr.message);
+    // 2) delete ONLY rows we previously had locally and have now removed.
+    const known = DB._known[k];
+    if (known) {
+      const toDelete = [...known].filter(id => id && !currentIds.has(id));
+      if (toDelete.length) {
+        const { error: delErr } = await supa.from(cfg.table).delete().in('id', toDelete);
+        if (delErr) console.warn('Supabase reconcile delete error:', cfg.table, delErr.message);
+      }
     }
+    DB._known[k] = currentIds; // baseline for the next push
   },
   // Pull ALL data for a scope from Supabase → localStorage
   async pullScope(scope) {
@@ -796,6 +967,7 @@ const DB = {
           } catch (e) { }
         }
         localStorage.setItem('lazymodes_' + key, JSON.stringify(data)); // write even [] to clear stale cache
+        DB._noteKnown(key, data); // refresh delete-baseline so we don't re-delete teammates' rows
       } catch (e) { }
     }));
     // Pull finance data
@@ -1281,8 +1453,44 @@ function renderSidebar() {
     rosterBtn.onclick = openTeamRoster;
     document.querySelector('.sb-bottom').prepend(rosterBtn);
   }
+  let actBtn = document.getElementById('sb-activity-btn');
+  if (isOwner && !actBtn) {
+    actBtn = document.createElement('div');
+    actBtn.id = 'sb-activity-btn';
+    actBtn.className = 'nav-item';
+    actBtn.style.color = 'var(--text2)';
+    actBtn.innerHTML = '<span class="nav-icon">🕒</span>Activity Log';
+    actBtn.onclick = openActivityLog;
+    document.querySelector('.sb-bottom').prepend(actBtn);
+  }
 
   updateStorageBar();
+}
+
+// Owner view of recent activity (this business scope). Falls back gracefully if the
+// activity_log table hasn't been created yet.
+async function openActivityLog() {
+  if (!isOwner) return;
+  openModal('Activity Log — ' + scopeLabel(scopeKey()), '<div style="text-align:center;padding:20px;color:var(--text3)">Loading…</div>', null, null, '', true);
+  try {
+    const { data, error } = await supa.from('activity_log')
+      .select('*').eq('scope', scopeKey() || '')
+      .order('created_at', { ascending: false }).limit(100);
+    if (error) throw error;
+    const rows = data || [];
+    const modal = document.getElementById('modal-body'); if (!modal) return;
+    modal.innerHTML = rows.length ? rows.map(a => `
+      <div style="display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+        <div style="width:26px;height:26px;border-radius:50%;background:var(--accent);flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#fff">${esc((a.user_name || '?').slice(0, 2).toUpperCase())}</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;color:var(--text)"><b>${esc(a.user_name || 'Someone')}</b> ${esc(a.action || '')}${a.entity_title ? ` — <span style="color:var(--text2)">${esc(a.entity_title)}</span>` : ''}</div>
+          <div style="font-size:10px;color:var(--text3);margin-top:1px">${new Date(a.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</div>
+        </div>
+      </div>`).join('') : '<div style="color:var(--text3);font-size:12px;padding:10px 0">No activity recorded yet for this business.</div>';
+  } catch (e) {
+    const modal = document.getElementById('modal-body');
+    if (modal) modal.innerHTML = `<div style="font-size:12px;color:var(--text2);line-height:1.6">The activity log isn't set up yet.<br>Run <b>ACTIVITY_COMMENTS_SETUP.sql</b> in your Supabase SQL editor to enable it.<br><span style="color:var(--text3);font-size:11px">(${esc(e.message || '')})</span></div>`;
+  }
 }
 
 async function setActiveBiz(id) {
@@ -1361,7 +1569,7 @@ function goPage(el, page) {
   hideTopProgress();
 }
 function renderPage(page) {
-  const titles = { dashboard: 'Dashboard', calendar: 'Calendar', notes: 'Brainstorm', tasks: 'Tasks', marketing: 'Marketing', sales: 'Sales & Inquiry', finance: 'Finance', rundown: 'Rundown', production: 'Production Tracker', vendors: 'Vendors', assets: 'Assets & Inventory', documents: 'Documents' };
+  const titles = { dashboard: 'Dashboard', calendar: 'Calendar', notes: 'Brainstorm', tasks: 'Tasks', mytasks: 'My Tasks', marketing: 'Marketing', sales: 'Sales & Inquiry', finance: 'Finance', rundown: 'Rundown', production: 'Production Tracker', vendors: 'Vendors', assets: 'Assets & Inventory', documents: 'Documents' };
   document.getElementById('page-title').textContent = titles[page] || page;
   const c = document.getElementById('content');
   const tb = document.getElementById('tb-actions');
@@ -1373,7 +1581,7 @@ function renderPage(page) {
     const proj = ps.find(x => x.id === p);
     document.getElementById('tb-biz-name').textContent = p === 'brand' ? 'OASE (Brand)' : 'OASE: ' + (proj?.name || p);
   }
-  const pages = { dashboard: pgDashboard, calendar: pgCalendar, notes: pgNotes, tasks: pgTasks, marketing: pgMarketing, sales: pgSales, finance: pgFinance, rundown: pgRundown, production: pgProduction, vendors: pgVendors, assets: pgAssets, documents: pgDocuments };
+  const pages = { dashboard: pgDashboard, calendar: pgCalendar, notes: pgNotes, tasks: pgTasks, mytasks: pgMyTasks, marketing: pgMarketing, sales: pgSales, finance: pgFinance, rundown: pgRundown, production: pgProduction, vendors: pgVendors, assets: pgAssets, documents: pgDocuments };
   try {
     (pages[page] || pgDashboard)(c, tb);
   } catch (e) {
@@ -1587,6 +1795,7 @@ function openAddEvent() {
       const gcalUrl = `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(title)}&dates=${date.replace(/-/g, '')}/${date.replace(/-/g, '')}&details=${encodeURIComponent(ev.desc || '')}`;
       window.open(gcalUrl, '_blank');
       closeModal(); renderPage('calendar');
+      logActivity('added event', 'calendar', title);
       showToast(inviteeIds.length ? 'Event added + ' + inviteeIds.length + ' member(s) notified' : 'Event added — Google Calendar opened');
     }, 'Save Event');
   // Load team members async
@@ -1660,6 +1869,7 @@ function saveNote(id) {
   if (id) { const i = notes.findIndex(n => n.id === id); if (i > -1) notes[i] = { ...notes[i], title, body, tag, color } }
   else notes.unshift({ id: 'n' + Date.now(), title, body, tag, color, date });
   DB.set('notes_' + sc, notes); closeModal(); renderNotesGrid(); showToast(id ? 'Note updated' : 'Note saved');
+  logActivity(id ? 'edited note' : 'added note', 'note', title);
 }
 function openAddNote() { openModal('New Note', noteForm(), () => saveNote(null), 'Save Note') }
 function openEditNote(id) {
@@ -1693,8 +1903,12 @@ function pgTasks(c, tb) {
     </div>`;
   }).join('')}</div>`;
 }
+function isOverdue(t) {
+  return t && t.due && t.status !== 'done' && t.due < new Date().toISOString().split('T')[0];
+}
 function renderTaskCard(t) {
-  return `<div class="task-card${t.priority ? ' task-priority' : ''}" onclick="openEditTask('${t.id}')">
+  const overdue = isOverdue(t);
+  return `<div class="task-card${t.priority ? ' task-priority' : ''}${overdue ? ' task-overdue' : ''}" onclick="openEditTask('${t.id}')">
     ${t.priority ? `<div class="priority-badge">⚡ Priority</div>` : ''}
     <div class="task-card-title">${t.title}</div>
     ${t.desc ? `<div class="task-card-desc">${t.desc}</div>` : ''}
@@ -1702,7 +1916,7 @@ function renderTaskCard(t) {
     <div class="task-meta">
       ${t.assignee ? `<span class="task-meta-chip">@${t.assignee}</span>` : ''}
       ${(t.cc || []).map(m => `<span class="task-meta-chip">cc @${m.name}</span>`).join('')}
-      ${t.due ? `<span class="task-meta-chip">📅 ${t.due}</span>` : ''}
+      ${t.due ? `<span class="task-meta-chip${overdue ? ' chip-overdue' : ''}">${overdue ? '⚠ Overdue · ' : '📅 '}${t.due}</span>` : ''}
       <span class="pill ${t.status === 'done' ? 'pill-green' : t.status === 'inprogress' ? 'pill-amber' : 'pill-gray'} ">${t.status === 'todo' ? 'To Do' : t.status === 'inprogress' ? 'In Progress' : 'Done'}</span>
     </div>
   </div>`;
@@ -1740,7 +1954,17 @@ function taskForm(t = {}) {
       <input type="file" id="task-img-input" accept="image/*" style="display:none" onchange="handleTaskImg(this)">
       ${t.img ? `<img src="${t.img}" class="img-preview" id="task-img-preview">` : '<img id="task-img-preview" style="display:none">'}
       <input type="hidden" id="task-img-data" value="${t.img || ''}">
-    </div>`;
+    </div>
+    ${t.id ? `<div class="form-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:4px">
+      <label>Discussion</label>
+      <div id="tk-comments" data-task-id="${t.id}" style="max-height:180px;overflow-y:auto;margin-bottom:8px">
+        <div style="font-size:11px;color:var(--text3);padding:4px 0">Loading comments…</div>
+      </div>
+      <div style="display:flex;gap:6px">
+        <input id="tk-comment-input" placeholder="Write a comment…" style="flex:1" onkeydown="if(event.key==='Enter'){event.preventDefault();addTaskComment('${t.id}')}">
+        <button class="btn btn-primary btn-sm" id="tk-comment-btn" onclick="addTaskComment('${t.id}')">Post</button>
+      </div>
+    </div>` : ''}`;
 }
 function handleTaskImg(input) {
   const file = input.files[0]; if (!file) return;
@@ -1754,40 +1978,54 @@ function handleTaskImg(input) {
 async function saveTask(id) {
   const title = document.getElementById('tk-title').value.trim(); if (!title) return showToast('Title required');
   const sc = scopeKey(); const tasks = DB.get('tasks_' + sc) || [];
+  const prevTask = id ? tasks.find(t => t.id === id) : null;
+  const prevStatus = prevTask?.status;
   const assigneeName = document.getElementById('tk-assign')?.value.trim() || '';
   const assigneeUid = getAssigneeUid(assigneeName);
   const priorityEl = document.getElementById('tk-priority');
-  const priority = priorityEl ? priorityEl.checked : (id ? (tasks.find(t => t.id === id)?.priority || false) : false);
+  const priority = priorityEl ? priorityEl.checked : (id ? (prevTask?.priority || false) : false);
   const cc = [...document.querySelectorAll('.tk-cc-check:checked')].map(c => ({ uid: c.dataset.uid, name: c.dataset.name }));
   const data = { title, desc: document.getElementById('tk-desc').value.trim(), assignee: assigneeName, assignee_uid: assigneeUid || '', due: document.getElementById('tk-due').value, status: document.getElementById('tk-status').value, img: document.getElementById('task-img-data').value, priority, cc };
   if (id) { const i = tasks.findIndex(t => t.id === id); if (i > -1) tasks[i] = { ...tasks[i], ...data } }
-  else tasks.push({ id: 't' + Date.now(), ...data });
+  else { data.created_by = currentUser?.id || ''; data.created_by_name = currentProfile?.name || 'Someone'; tasks.push({ id: 't' + Date.now(), ...data }); }
   DB.set('tasks_' + sc, tasks);
   const taskRecord = tasks.find(t => id ? t.id === id : !id) || data;
   sbUpsert('tasks', { ...taskRecord, scope: sc }).catch(() => { });
+  const statusLabel = s => s === 'todo' ? 'To Do' : s === 'inprogress' ? 'In Progress' : 'Done';
   if (!id) {
     let notifiedCount = 0;
     if (assigneeUid && assigneeUid !== currentUser?.id) {
       notifiedCount++;
-      supa.from('notifications').insert({
-        user_id: assigneeUid, type: 'task_assigned',
-        title: '📋 New task assigned to you: ' + title,
-        body: 'Due: ' + (data.due || 'TBD'),
-        link: 'tasks'
-      }).catch(() => { });
+      sendNotification(assigneeUid, '📋 New task assigned to you: ' + title, 'Due: ' + (data.due || 'TBD'), 'tasks');
     }
     const ccToNotify = cc.filter(m => m.uid && m.uid !== currentUser?.id && m.uid !== assigneeUid);
     ccToNotify.forEach(m => {
       notifiedCount++;
-      supa.from('notifications').insert({
-        user_id: m.uid, type: 'task_tagged',
-        title: '📋 You were tagged on a task: ' + title,
-        body: 'Assigned to ' + (assigneeName || 'unassigned') + ' · Due: ' + (data.due || 'TBD'),
-        link: 'tasks'
-      }).catch(() => { });
+      sendNotification(m.uid, '📋 You were tagged on a task: ' + title, 'Assigned to ' + (assigneeName || 'unassigned') + ' · Due: ' + (data.due || 'TBD'), 'tasks');
     });
+    logActivity('created task', 'task', title);
     showToast(notifiedCount ? 'Task created + ' + notifiedCount + ' member(s) notified ✓' : 'Task created');
   } else {
+    // Notify the people who care when the STATUS changes — the creator, the assignee,
+    // and anyone cc'd — except whoever made the change.
+    const statusChanged = prevStatus && prevStatus !== data.status;
+    if (statusChanged) {
+      const recipients = new Set();
+      if (prevTask?.created_by) recipients.add(prevTask.created_by);
+      if (assigneeUid) recipients.add(assigneeUid);
+      (cc || []).forEach(m => m.uid && recipients.add(m.uid));
+      recipients.delete(currentUser?.id);
+      const actor = currentProfile?.name || 'Someone';
+      recipients.forEach(uid => {
+        const done = data.status === 'done';
+        sendNotification(uid,
+          (done ? '✅ Task completed: ' : '🔄 Task moved to ' + statusLabel(data.status) + ': ') + title,
+          'by ' + actor, 'tasks');
+      });
+      logActivity('moved task to ' + statusLabel(data.status), 'task', title);
+    } else {
+      logActivity('edited task', 'task', title);
+    }
     showToast('Task updated');
   }
   closeModal(); renderPage('tasks');
@@ -1799,7 +2037,7 @@ function openAddTask(status = 'todo') {
 function openEditTask(id) {
   const sc = scopeKey(); const tasks = DB.get('tasks_' + sc) || []; const t = tasks.find(x => x.id === id); if (!t) return;
   openModal('Edit Task', taskForm(t), () => saveTask(id), 'Save Task', `<button class="btn btn-danger" onclick="deleteTask('${id}')">Delete</button>`);
-  setTimeout(() => { populateAssigneeDropdown(t.assignee || ''); populateTaskCc((t.cc || []).map(m => m.uid)); }, 200);
+  setTimeout(() => { populateAssigneeDropdown(t.assignee || ''); populateTaskCc((t.cc || []).map(m => m.uid)); loadTaskComments(id); }, 200);
 }
 async function populateTaskCc(selectedUids) {
   const wrap = document.getElementById('tk-cc-wrap'); if (!wrap) return;
@@ -1870,8 +2108,87 @@ function getAssigneeUid(name) {
 }
 
 function deleteTask(id) {
-  const sc = scopeKey(); const tasks = (DB.get('tasks_' + sc) || []).filter(t => t.id !== id);
+  const sc = scopeKey(); const all = DB.get('tasks_' + sc) || [];
+  const removed = all.find(t => t.id === id);
+  const tasks = all.filter(t => t.id !== id);
   DB.set('tasks_' + sc, tasks); closeModal(); renderPage('tasks'); showToast('Deleted');
+  if (removed) logActivity('deleted task', 'task', removed.title);
+}
+
+// ═══════════════════════════════════════════════════
+// MY TASKS — everything assigned to me, across all businesses
+// ═══════════════════════════════════════════════════
+function scopeLabel(scope) {
+  const bizzes = DB.get('businesses') || [];
+  if (scope && scope.startsWith('oase_')) {
+    if (scope === 'oase_brand') return 'OASE (Brand)';
+    const projs = DB.get('oase_projects') || [];
+    const p = projs.find(x => x.id === scope.replace('oase_', ''));
+    return 'OASE: ' + (p?.name || scope.replace('oase_', ''));
+  }
+  return bizzes.find(b => b.id === scope)?.name || scope;
+}
+// Jump to the business/project a task lives in, then open the Tasks board there.
+function gotoTaskScope(scope) {
+  if (scope && scope.startsWith('oase_')) {
+    DB.set('active_biz', 'oase');
+    DB.set('active_oase_proj', scope === 'oase_brand' ? 'brand' : scope.replace('oase_', ''));
+  } else {
+    DB.set('active_biz', scope);
+  }
+  renderSidebar();
+  const navItem = document.querySelector('.nav-item[data-page="tasks"]');
+  if (navItem) goPage(navItem, 'tasks'); else { currentPage = 'tasks'; renderPage('tasks'); }
+  const sc = scopeKey();
+  if (sc) DB.pullScope(sc).then(() => { if (currentPage === 'tasks') renderPage('tasks'); }).catch(() => { });
+}
+async function pgMyTasks(c, tb) {
+  tb.innerHTML = '';
+  if (!currentUser) { c.innerHTML = `<div class="empty"><div class="empty-icon">★</div><p>Sign in to see your tasks.</p></div>`; return; }
+  c.innerHTML = `<div class="empty"><div class="empty-icon">★</div><p>Loading your tasks…</p></div>`;
+  let mine = [];
+  try {
+    const { data, error } = await supa.from('tasks').select('*').eq('assignee_uid', currentUser.id);
+    if (error) throw error;
+    mine = data || [];
+  } catch (e) {
+    c.innerHTML = `<div class="empty"><div class="empty-icon">⚠</div><p>Couldn't load your tasks.</p><p style="font-size:11px;color:var(--text3)">${esc(e.message || '')}</p></div>`;
+    return;
+  }
+  const today = new Date().toISOString().split('T')[0];
+  const byDue = (a, b) => (a.due || '9999').localeCompare(b.due || '9999');
+  const active = mine.filter(t => t.status !== 'done');
+  const overdue = active.filter(t => t.due && t.due < today).sort(byDue);
+  const dueToday = active.filter(t => t.due === today).sort(byDue);
+  const upcoming = active.filter(t => !t.due || t.due > today).sort(byDue);
+  const done = mine.filter(t => t.status === 'done').sort((a, b) => byDue(b, a)).slice(0, 15);
+
+  const row = t => `
+    <div class="mt-row" onclick="gotoTaskScope('${t.scope}')">
+      <div style="flex:1;min-width:0">
+        <div style="font-size:12px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(t.title)}</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:2px">${esc(scopeLabel(t.scope))}${t.priority ? ' · ⚡ Priority' : ''}</div>
+      </div>
+      ${t.due ? `<span class="task-meta-chip${isOverdue(t) ? ' chip-overdue' : ''}" style="flex-shrink:0">${isOverdue(t) ? '⚠ ' : '📅 '}${t.due}</span>` : ''}
+      <span class="pill ${t.status === 'done' ? 'pill-green' : t.status === 'inprogress' ? 'pill-amber' : 'pill-gray'}" style="flex-shrink:0">${t.status === 'todo' ? 'To Do' : t.status === 'inprogress' ? 'In Progress' : 'Done'}</span>
+    </div>`;
+  const section = (label, arr, color) => arr.length ? `
+    <div class="card" style="margin-bottom:12px">
+      <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:${color};margin-bottom:8px">${label} · ${arr.length}</div>
+      ${arr.map(row).join('')}
+    </div>` : '';
+
+  const total = active.length;
+  c.innerHTML = `
+    <div style="margin-bottom:16px">
+      <h1 style="font-family:'Syne',sans-serif;font-size:20px;font-weight:800">My Tasks</h1>
+      <p style="color:var(--text2);font-size:12px;margin-top:2px">${total} open · ${overdue.length} overdue · ${dueToday.length} due today — across all businesses</p>
+    </div>
+    ${section('⚠ Overdue', overdue, 'var(--red)')}
+    ${section('Due Today', dueToday, 'var(--amber)')}
+    ${section('Upcoming', upcoming, 'var(--accent)')}
+    ${section('Recently Done', done, 'var(--green)')}
+    ${!mine.length ? `<div class="empty"><div class="empty-icon">✓</div><p>Nothing assigned to you yet.</p></div>` : ''}`;
 }
 
 // ═══════════════════════════════════════════════════
@@ -1987,7 +2304,22 @@ function renderTrackerRow(p) {
 function updateMktStatus(id, status) {
   const sc = scopeKey(); const posts = DB.get('mkt_' + sc) || [];
   const i = posts.findIndex(p => p.id === id); if (i < 0) return;
+  const oldStatus = posts[i].status;
   posts[i].status = status; DB.set('mkt_' + sc, posts); renderPage('marketing');
+  if (oldStatus !== status) notifyMktStatusChange(posts[i], status);
+}
+
+// Content status moved → tell the people on the other side of the handoff.
+// Crew updates → owner is notified; owner updates → Sales & Marketing dept is notified.
+function notifyMktStatusChange(post, status) {
+  const label = (MKT_STATUS[status] || {}).label || status;
+  const name = post.code || post.topic || post.caption || 'content';
+  const actor = currentProfile?.name || 'Someone';
+  const title = '🎨 Content ' + name + ' → ' + label;
+  const body = 'by ' + actor;
+  if (isOwner) notifyDept(scopeKey(), 'Sales & Marketing', title, body, 'marketing').catch(() => { });
+  else notifyOwners(title, body, 'marketing');
+  logActivity('moved content to ' + label, 'marketing', name);
 }
 
 function deleteMktPost(id) {
@@ -2114,6 +2446,7 @@ function saveMktEP(id) {
   while (document.getElementById('slide-hl-' + si)) {
     slides.push({ headline: document.getElementById('slide-hl-' + si).value.trim(), body: (document.getElementById('slide-bd-' + si)?.value || '').trim() }); si++;
   }
+  const prevMktStatus = posts[i].status;
   posts[i] = {
     ...posts[i],
     date: document.getElementById('ep-date').value,
@@ -2135,6 +2468,8 @@ function saveMktEP(id) {
     slides,
   };
   DB.set('mkt_' + sc, posts); showToast('EP saved ✓');
+  if (prevMktStatus !== posts[i].status) notifyMktStatusChange(posts[i], posts[i].status);
+  else logActivity('edited content', 'marketing', posts[i].code || posts[i].topic || '');
 }
 
 function openAddSingleMkt() {
@@ -2650,6 +2985,8 @@ function approveReceipt(id) {
   const am = calcEntryAmounts(e);
   fd.cashflow.unshift({ id: 'c' + Date.now(), date: e.date || new Date().toISOString().split('T')[0], desc: e.name + ' — ' + e.product, type: 'in', amount: am.final, category: 'Product Sales', from_sale: id });
   DB.set('finance_' + sc, fd);
+  notifyDept(getSalesSc(), 'Sales & Marketing', '✓ Receipt verified: ' + e.name, 'Income recorded in Finance by ' + (currentProfile?.name || 'Finance'), 'sales').catch(() => { });
+  logActivity('approved receipt', 'sale', e.name);
   showToast('Receipt approved — income recorded in Finance ✓');
   renderPage('sales');
 }
@@ -2660,7 +2997,10 @@ function rejectReceipt(id) {
     <div class="form-row"><label>Rejection Note</label><textarea id="rej-note" rows="2" placeholder="e.g. Blurry image, wrong amount shown"></textarea></div>`,
     () => {
       e.receipt_status = 'rejected'; e.receipt_note = document.getElementById('rej-note').value.trim();
-      setSD(sd); closeModal(); showToast('Receipt rejected — seller notified'); renderPage('sales');
+      setSD(sd); closeModal();
+      notifyDept(getSalesSc(), 'Sales & Marketing', '✗ Receipt rejected: ' + e.name, (e.receipt_note || 'Please re-upload') + ' — ' + (currentProfile?.name || 'Finance'), 'sales').catch(() => { });
+      logActivity('rejected receipt', 'sale', e.name);
+      showToast('Receipt rejected — seller notified'); renderPage('sales');
     }, 'Reject');
 }
 function viewReceipt(id) {
@@ -2865,6 +3205,7 @@ function saveSale(id) {
     }
   }
   closeModal(); renderPage('sales'); showToast('Entry saved');
+  logActivity(id ? 'edited sale entry' : 'added sale entry', 'sale', data.name);
 }
 function openAddSale() { openModal('New Sale Entry', saleForm(), () => saveSale(null), 'Save Entry', '', true); setTimeout(recalcSalePreview, 100) }
 function openEditSale(id) {
@@ -4416,14 +4757,28 @@ function renderDocDetail(c, tb) {
   </div>`;
 }
 
+// Human labels for document statuses (used in notifications).
+const DOC_STATUS_LABEL = { submitted: 'Submitted', owner_approved: 'Approved by Owner', owner_rejected: 'Rejected by Owner', completed: 'Completed / Paid' };
+function notifyDocStatus(d, statusKey, extra = '') {
+  const label = DOC_STATUS_LABEL[statusKey] || statusKey;
+  if (d.created_by && d.created_by !== currentUser?.id) {
+    sendNotification(d.created_by, '📄 ' + d.ref + ': ' + label, (extra || 'by ' + (currentProfile?.name || 'Someone')), 'documents').catch(() => { });
+  }
+  logActivity('set ' + d.ref + ' to ' + label, 'document', d.title || d.ref);
+}
 function approveDoc(id, newStatus) {
   const docs = getDocs(); const d = docs.find(x => x.id === id); if (!d) return;
   if (newStatus === 'owner_rejected') {
     openModal('Reject Request', `<div class="form-row"><label>Rejection Note</label><textarea id="rej-note" rows="2" placeholder="Reason for rejection…"></textarea></div>`,
-      () => { d.status = 'owner_rejected'; d.owner_note = document.getElementById('rej-note').value.trim(); setDocs(docs); closeModal(); renderPage('documents'); showToast('Rejected'); }, 'Reject');
+      () => {
+        d.status = 'owner_rejected'; d.owner_note = document.getElementById('rej-note').value.trim();
+        setDocs(docs); closeModal(); renderPage('documents'); showToast('Rejected');
+        notifyDocStatus(d, 'owner_rejected', d.owner_note || undefined);
+      }, 'Reject');
     return;
   }
   d.status = newStatus; setDocs(docs); renderPage('documents'); showToast('Status updated');
+  notifyDocStatus(d, newStatus);
 }
 function openFinanceExecute(id) {
   const docs = getDocs(); const d = docs.find(x => x.id === id); if (!d) return;
@@ -4443,6 +4798,7 @@ function openFinanceExecute(id) {
       DB.set('finance_' + sc, fd);
       // Notify submitter
       if (d.created_by) { sendNotification(d.created_by, 'Payment Executed', 'Your ' + d.ref + ' has been processed and receipt uploaded.', 'documents').catch(() => { }); }
+      logActivity('executed payment', 'document', d.ref);
       sbUpsert('documents', { ...d, scope: getOpsSc() }).catch(() => { });
       closeModal(); renderPage('documents'); showToast('Payment executed — Finance cashflow updated ✓');
     }, 'Mark as Executed');
@@ -4475,15 +4831,11 @@ function openNewDoc(type) {
       () => {
         const title = document.getElementById('nd-title').value.trim(); if (!title) return showToast('Title required');
         const docs = getDocs();
-        docs.unshift({ id: 'doc' + Date.now(), type: 'payment_request', ref, title, vendor: document.getElementById('nd-vendor').value || document.getElementById('nd-vendor').options[0]?.value || '', amount: parseInt(document.getElementById('nd-amount').value) || 0, purpose: document.getElementById('nd-purpose').value.trim(), category: document.getElementById('nd-cat').value, needed_by: document.getElementById('nd-needed').value, submitted_by: document.getElementById('nd-by').value.trim(), submitted_at: new Date().toISOString().split('T')[0], status: 'submitted', owner_note: '', finance_receipt: '', notes: document.getElementById('nd-notes').value.trim(), support_doc: '' });
+        docs.unshift({ id: 'doc' + Date.now(), type: 'payment_request', ref, title, vendor: document.getElementById('nd-vendor').value || document.getElementById('nd-vendor').options[0]?.value || '', amount: parseInt(document.getElementById('nd-amount').value) || 0, purpose: document.getElementById('nd-purpose').value.trim(), category: document.getElementById('nd-cat').value, needed_by: document.getElementById('nd-needed').value, submitted_by: document.getElementById('nd-by').value.trim(), submitted_at: new Date().toISOString().split('T')[0], status: 'submitted', owner_note: '', finance_receipt: '', notes: document.getElementById('nd-notes').value.trim(), support_doc: '', created_by: currentUser?.id || '', created_by_name: currentProfile?.name || '' });
         setDocs(docs);
         sbUpsert('documents', { ...docs[0], scope: getOpsSc() }).catch(() => { });
-        // Notify owner
-        if (currentUser && isOwner === false) {
-          supa.from('profiles').select('id').eq('role', 'owner').then(({ data }) => {
-            if (data) data.forEach(o => sendNotification(o.id, 'Payment Request Submitted', title + ' — Rp ' + fmtN(parseInt(document.getElementById('nd-amount')?.value) || 0), 'documents'));
-          });
-        }
+        if (!isOwner) notifyOwners('📄 Payment Request Submitted: ' + ref, title + ' — Rp ' + fmtN(parseInt(document.getElementById('nd-amount')?.value) || 0), 'documents');
+        logActivity('submitted payment request', 'document', title);
         closeModal(); renderPage('documents'); showToast('Payment request submitted');
       }, 'Submit Request', '', true);
   } else {
@@ -4515,8 +4867,10 @@ function openNewDoc(type) {
         }
         if (!items.length) return showToast('Add at least one item');
         const docs = getDocs(); const total = items.reduce((a, x) => a + x.amount, 0);
-        docs.unshift({ id: 'doc' + Date.now(), type: 'reimbursement', ref, title: document.getElementById('rb-ref').value.trim() || ref, submitted_by: by, submitted_at: document.getElementById('rb-date').value, status: 'submitted', items, bank_name: document.getElementById('rb-bank').value.trim(), bank_account: document.getElementById('rb-acc').value.trim(), bank_holder: document.getElementById('rb-holder').value.trim(), total, finance_receipt: '', notes: '' });
+        docs.unshift({ id: 'doc' + Date.now(), type: 'reimbursement', ref, title: document.getElementById('rb-ref').value.trim() || ref, submitted_by: by, submitted_at: document.getElementById('rb-date').value, status: 'submitted', items, bank_name: document.getElementById('rb-bank').value.trim(), bank_account: document.getElementById('rb-acc').value.trim(), bank_holder: document.getElementById('rb-holder').value.trim(), total, finance_receipt: '', notes: '', created_by: currentUser?.id || '', created_by_name: currentProfile?.name || '' });
         setDocs(docs); closeModal(); renderPage('documents'); showToast('Reimbursement submitted');
+        if (!isOwner) notifyOwners('📄 Reimbursement Submitted: ' + ref, (by || 'A team member') + ' — Rp ' + fmtN(total), 'documents');
+        logActivity('submitted reimbursement', 'document', ref);
       }, 'Submit', '', true);
   }
 }
