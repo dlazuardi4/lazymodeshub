@@ -210,6 +210,21 @@
     <div class="gl-box"><span class="spinner"></span><span id="gl-msg">Loading…</span></div>
   </div>
 
+  <!-- TEAM CHAT (floating, bottom-right) -->
+  <div id="chat-fab" onclick="toggleTeamChat()" title="Team Chat">💬<span id="chat-badge">0</span></div>
+  <div id="chat-panel">
+    <div class="chat-head">
+      <span id="chat-title">💬 Team Chat</span>
+      <button class="btn-icon" onclick="toggleTeamChat()">✕</button>
+    </div>
+    <div id="chat-msgs"></div>
+    <div class="chat-inputrow">
+      <input id="chat-input" placeholder="Message your team…"
+        onkeydown="if(event.key==='Enter'){event.preventDefault();sendTeamChat()}">
+      <button class="btn btn-primary btn-sm" id="chat-send-btn" onclick="sendTeamChat()">➤</button>
+    </div>
+  </div>
+
   <!-- Link ke file JavaScript eksternal (loaded last, so page elements exist first) -->
   <script src="app.js"></script>
 

@@ -727,11 +727,89 @@ async function addTaskComment(taskId) {
     if (btn) { btn.classList.remove('btn-loading'); btn.innerHTML = 'Post'; }
   }
 }
-// Realtime: if a comment lands on the task we're currently editing, refresh the thread.
+// Realtime: route incoming comment events to the right place — team chat panel,
+// unread badge, or the task discussion thread currently open.
 function onRemoteCommentChange(payload) {
   const taskId = payload?.new?.task_id ?? payload?.old?.task_id;
+  if (!taskId) return;
+  if (taskId.startsWith('teamchat_')) {
+    if (taskId !== chatThreadId()) return; // another business's chat
+    if (_chatOpen) loadTeamChat();
+    else if (payload?.new?.user_id !== currentUser?.id) { _chatUnread++; updateChatBadge(); }
+    return;
+  }
   const openId = document.getElementById('tk-comments')?.dataset.taskId;
-  if (taskId && openId && taskId === openId) loadTaskComments(taskId);
+  if (openId && taskId === openId) loadTaskComments(taskId);
+}
+
+// ═══════════════════════════════════════════════════
+// TEAM CHAT — floating messenger, one thread per business
+// ═══════════════════════════════════════════════════
+// Messages live in the same task_comments table under a special thread id,
+// so the existing realtime subscription powers the chat for free.
+let _chatOpen = false, _chatUnread = 0;
+function chatThreadId() { return 'teamchat_' + (scopeKey() || 'global'); }
+function toggleTeamChat() {
+  _chatOpen = !_chatOpen;
+  const p = document.getElementById('chat-panel');
+  if (p) p.classList.toggle('open', _chatOpen);
+  if (_chatOpen) {
+    _chatUnread = 0; updateChatBadge();
+    const title = document.getElementById('chat-title');
+    if (title) title.textContent = '💬 ' + scopeLabel(scopeKey() || '') + ' Chat';
+    loadTeamChat();
+    setTimeout(() => document.getElementById('chat-input')?.focus(), 100);
+  }
+}
+function updateChatBadge() {
+  const b = document.getElementById('chat-badge'); if (!b) return;
+  b.style.display = _chatUnread > 0 ? 'block' : 'none';
+  b.textContent = _chatUnread > 9 ? '9+' : _chatUnread;
+}
+// Called when the active business changes so an open panel follows along.
+function refreshTeamChatScope() {
+  if (!_chatOpen) return;
+  const title = document.getElementById('chat-title');
+  if (title) title.textContent = '💬 ' + scopeLabel(scopeKey() || '') + ' Chat';
+  loadTeamChat();
+}
+async function loadTeamChat() {
+  const wrap = document.getElementById('chat-msgs'); if (!wrap) return;
+  try {
+    const { data, error } = await supa.from('task_comments').select('*')
+      .eq('task_id', chatThreadId()).order('created_at', { ascending: true }).limit(100);
+    if (error) throw error;
+    const msgs = data || [];
+    wrap.innerHTML = msgs.length ? msgs.map(m => `
+      <div class="chat-msg${m.user_id === currentUser?.id ? ' mine' : ''}">
+        ${m.user_id === currentUser?.id ? '' : `<div class="cm-name">${esc(m.user_name || '?')}</div>`}
+        <div>${esc(m.body)}</div>
+        <div class="cm-time">${new Date(m.created_at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}</div>
+      </div>`).join('') : '<div style="font-size:11px;color:var(--text3);text-align:center;margin:auto">No messages yet — say hi to your team 👋</div>';
+    wrap.scrollTop = wrap.scrollHeight;
+  } catch (e) {
+    wrap.innerHTML = '<div style="font-size:11px;color:var(--text3);text-align:center;margin:auto;padding:0 16px">Chat isn\'t set up yet.<br>Run <b>ACTIVITY_COMMENTS_SETUP.sql</b> in Supabase first.</div>';
+  }
+}
+async function sendTeamChat() {
+  const input = document.getElementById('chat-input'); if (!input) return;
+  const body = input.value.trim(); if (!body) return;
+  const btn = document.getElementById('chat-send-btn');
+  if (btn?.dataset.busy) return; // no double-send
+  if (btn) { btn.dataset.busy = '1'; btn.classList.add('btn-loading'); btn.innerHTML = '<span class="spinner"></span>'; }
+  try {
+    const { error } = await supa.from('task_comments').insert({
+      task_id: chatThreadId(), scope: scopeKey() || '',
+      user_id: currentUser.id, user_name: currentProfile?.name || currentUser.email || 'Someone', body
+    });
+    if (error) throw error;
+    input.value = '';
+    await loadTeamChat();
+  } catch (e) {
+    showToast('Could not send — has ACTIVITY_COMMENTS_SETUP.sql been run?', 4000);
+  } finally {
+    if (btn) { delete btn.dataset.busy; btn.classList.remove('btn-loading'); btn.innerHTML = '➤'; }
+  }
 }
 
 // ═══════════════════════════════════════════════════
@@ -1498,6 +1576,7 @@ async function setActiveBiz(id) {
   closeBizDD();
   renderSidebar();
   renderPage(currentPage);
+  refreshTeamChatScope();
   const sc = scopeKey();
   if (sc) {
     showTopProgress();
@@ -1513,6 +1592,7 @@ async function switchBiz(id) {
   closeBizDD();
   renderSidebar();
   renderPage('dashboard');
+  refreshTeamChatScope();
   const sc = scopeKey();
   if (sc) {
     showTopProgress();
@@ -1533,6 +1613,7 @@ async function setOaseProj(id) {
   closeBizDD();
   renderSidebar();
   renderPage(currentPage);
+  refreshTeamChatScope();
   const sc = scopeKey();
   if (sc) {
     showTopProgress();
@@ -1902,13 +1983,31 @@ function pgTasks(c, tb) {
       <div class="kan-add" onclick="openAddTask('${col.k}')">+ Add task</div>
     </div>`;
   }).join('')}</div>`;
+  injectTaskCommentCounts();
+}
+// Show a "💬 n" chip on cards that have a discussion, so comments are discoverable
+// straight from the board. Silent no-op if the comments table isn't set up yet.
+async function injectTaskCommentCounts() {
+  try {
+    const sc = scopeKey(); if (!sc || !currentUser) return;
+    const { data } = await supa.from('task_comments').select('task_id').eq('scope', sc);
+    if (!data) return;
+    const counts = {};
+    data.forEach(r => { if (r.task_id && !r.task_id.startsWith('teamchat_')) counts[r.task_id] = (counts[r.task_id] || 0) + 1; });
+    Object.entries(counts).forEach(([tid, n]) => {
+      const meta = document.querySelector(`.task-card[data-task-id="${tid}"] .task-meta`);
+      if (meta && !meta.querySelector('.cm-count')) {
+        meta.insertAdjacentHTML('beforeend', `<span class="task-meta-chip cm-count">💬 ${n}</span>`);
+      }
+    });
+  } catch (e) { }
 }
 function isOverdue(t) {
   return t && t.due && t.status !== 'done' && t.due < new Date().toISOString().split('T')[0];
 }
 function renderTaskCard(t) {
   const overdue = isOverdue(t);
-  return `<div class="task-card${t.priority ? ' task-priority' : ''}${overdue ? ' task-overdue' : ''}" onclick="openEditTask('${t.id}')">
+  return `<div class="task-card${t.priority ? ' task-priority' : ''}${overdue ? ' task-overdue' : ''}" data-task-id="${t.id}" onclick="openEditTask('${t.id}')">
     ${t.priority ? `<div class="priority-badge">⚡ Priority</div>` : ''}
     <div class="task-card-title">${t.title}</div>
     ${t.desc ? `<div class="task-card-desc">${t.desc}</div>` : ''}
@@ -1977,6 +2076,9 @@ function handleTaskImg(input) {
 }
 async function saveTask(id) {
   const title = document.getElementById('tk-title').value.trim(); if (!title) return showToast('Title required');
+  if (saveTask._busy) return; // extra safety: never create the same task twice
+  saveTask._busy = true;
+  setTimeout(() => { saveTask._busy = false; }, 1200);
   const sc = scopeKey(); const tasks = DB.get('tasks_' + sc) || [];
   const prevTask = id ? tasks.find(t => t.id === id) : null;
   const prevStatus = prevTask?.status;
@@ -2028,6 +2130,7 @@ async function saveTask(id) {
     }
     showToast('Task updated');
   }
+  saveTask._busy = false;
   closeModal(); renderPage('tasks');
 }
 function openAddTask(status = 'todo') {
@@ -3964,12 +4067,19 @@ function openModal(title, body, onConfirm, confirmLabel = 'Save', extraButtons =
   const confirmBtn = document.getElementById('modal-confirm');
   if (typeof onConfirm === 'function') {
     confirmBtn.onclick = async function () {
+      if (confirmBtn.dataset.busy) return; // HARD LOCK: a second press does nothing
+      confirmBtn.dataset.busy = '1';
       const originalLabel = confirmBtn.innerHTML;
       confirmBtn.classList.add('btn-loading');
       confirmBtn.innerHTML = `<span class="spinner"></span> Saving…`;
+      foot.style.pointerEvents = 'none';   // also freeze Cancel/Delete while saving
+      showLoading('Saving… please wait');  // full-screen blocker — nothing is clickable
       try {
         await onConfirm();
       } finally {
+        hideLoading();
+        foot.style.pointerEvents = '';
+        delete confirmBtn.dataset.busy;
         if (document.getElementById('modal-confirm') === confirmBtn) {
           confirmBtn.classList.remove('btn-loading');
           confirmBtn.innerHTML = originalLabel;
@@ -4001,15 +4111,21 @@ function showToast(msg, dur = 2500) {
 
 // ── Global loading indicators ──
 let _loadingDepth = 0;
+let _loadingShownAt = 0;
 function showLoading(msg = 'Loading…') {
   _loadingDepth++;
+  if (_loadingDepth === 1) _loadingShownAt = Date.now();
   const msgEl = document.getElementById('gl-msg'); if (msgEl) msgEl.textContent = msg;
   document.getElementById('global-loading')?.classList.add('show');
 }
 function hideLoading() {
   _loadingDepth = Math.max(0, _loadingDepth - 1);
   if (_loadingDepth > 0) return;
-  document.getElementById('global-loading')?.classList.remove('show');
+  // Keep the blocker visible for a beat even on instant saves, so the user
+  // always SEES that the action was received (prevents "did it work?" re-clicks).
+  const elapsed = Date.now() - _loadingShownAt;
+  const hide = () => { if (_loadingDepth === 0) document.getElementById('global-loading')?.classList.remove('show'); };
+  if (elapsed < 400) setTimeout(hide, 400 - elapsed); else hide();
 }
 function showTopProgress() {
   const el = document.getElementById('top-progress'); if (!el) return;
